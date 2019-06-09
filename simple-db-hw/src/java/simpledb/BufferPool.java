@@ -508,6 +508,8 @@ public class BufferPool {
         if(pg.isDirty() != null) {
         	int tableid = pid.getTableId();
         	DbFile df = Database.getCatalog().getDatabaseFile(tableid);
+        	Database.getLogFile().logWrite(pg.isDirty(), pg.getBeforeImage(), pg);
+            Database.getLogFile().force();
         	df.writePage(pg);
         	pg.markDirty(false, null);
         }

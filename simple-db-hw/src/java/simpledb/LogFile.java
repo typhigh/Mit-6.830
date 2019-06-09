@@ -460,17 +460,50 @@ public class LogFile {
         be enforced by this method.)
 
         @param tid The transaction to rollback
+     * @throws IOException 
     */
+    
+    
+	/*
+	record type
+		transaction id
+		before page data (see writePageData)
+		after page data
+		start offset
+	*/
+    
+    private void dorollback(Long tid, Long pos) throws IOException {
+    	this.print();
+        preAppend();
+        // some code goes here
+        raf.seek(pos - LONG_SIZE);
+        long startOffset = raf.readLong();
+        long begin = this.tidToFirstLogRecord.get(tid);
+        while(begin < startOffset) {
+        	raf.seek(startOffset); 
+        	int recordType = raf.readInt();
+        	if(recordType == UPDATE_RECORD) {
+        		long nowTidNumber = raf.readLong();
+        		if(tid == nowTidNumber) {
+        			Page beforePg = readPageData(raf);
+        			Database.getCatalog().getDatabaseFile(beforePg.getId().getTableId()).writePage(beforePg);
+        			Database.getBufferPool().discardPage(beforePg.getId());
+        		}
+        	}
+        	raf.seek(startOffset - LONG_SIZE);
+        	startOffset = raf.readLong();
+        }
+        raf.seek(currentOffset);
+    }
     public void rollback(TransactionId tid)
         throws NoSuchElementException, IOException {
         synchronized (Database.getBufferPool()) {
             synchronized(this) {
-                preAppend();
-                // some code goes here
+            	dorollback(tid.getId(), raf.length());
             }
         }
     }
-
+    
     /** Shutdown the logging system, writing out whatever state
         is necessary so that start up can happen quickly (without
         extensive recovery.)
@@ -494,6 +527,128 @@ public class LogFile {
             synchronized (this) {
                 recoveryUndecided = false;
                 // some code goes here
+                
+                raf.seek(0);
+                long checkPointOffset = raf.readLong();
+                long redoBeg;
+                HashSet<Long> commits = new HashSet<Long>(); 
+                HashSet<Long> undos = new HashSet<Long>();
+                if(checkPointOffset == NO_CHECKPOINT_ID) {
+                	redoBeg = LONG_SIZE;
+                }
+                else {
+                	raf.seek(checkPointOffset);
+                	int recordType = raf.readInt();
+                	assert(recordType == CHECKPOINT_RECORD);
+                	assert(raf.readLong() == -1);
+                	int cnt = raf.readInt();
+                	redoBeg = checkPointOffset;
+                	for(int i = 1; i <= cnt; ++i) {
+                		long tid = raf.readLong();
+                		long tidOffset = raf.readLong();
+                		tidToFirstLogRecord.put(tid, tidOffset);
+                		undos.add(tid);
+                	}
+                }
+                currentOffset = raf.length();
+                //step1 recover the information about txns
+                //from last to next(it's easier to back than forward)
+                raf.seek(raf.length() - LONG_SIZE);
+                for(long curOffset = raf.readLong(); curOffset >= redoBeg;) {
+                	raf.seek(curOffset);
+                	int recordType = raf.readInt();
+                	long tid;
+                	switch(recordType) {
+                	case BEGIN_RECORD:
+                		tid = raf.readLong();
+                		undos.add(tid);
+                		break;
+                	case COMMIT_RECORD:
+                		tid = raf.readLong();
+                		commits.add(tid);
+                		break;
+                	case UPDATE_RECORD:
+                		break;
+                	case ABORT_RECORD:
+                		break;
+                	case CHECKPOINT_RECORD:
+                		break;
+                	}
+                	if(curOffset <= redoBeg) {
+                		curOffset = -1;
+                	}
+                	else {
+                		raf.seek(curOffset - LONG_SIZE);
+                		curOffset = raf.readLong();
+                	}
+                }
+                //step2 redo phase
+                for(long curOffset = redoBeg; curOffset < currentOffset;) {
+                	raf.seek(curOffset);
+                	int recordType = raf.readInt();
+                	switch(recordType) {
+                	case CHECKPOINT_RECORD:
+                		{
+                			//do nothing                			
+                			assert(checkPointOffset == curOffset);
+                			assert(raf.readLong() == -1);
+                			int cnt = raf.readInt();
+                			curOffset = raf.getFilePointer() + cnt * LONG_SIZE * 2; //skip active tids
+                			break;
+                		}
+               		
+                	case ABORT_RECORD:
+                		//undo
+                		{	
+                			Long tid = raf.readLong();
+                			if(!tidToFirstLogRecord.containsKey(tid)) {
+                				throw new IOException("Abort not exist txn");
+                			}
+                			dorollback(tid, curOffset);
+                			curOffset += INT_SIZE * LONG_SIZE;//record_type and tid
+                			tidToFirstLogRecord.remove(tid);
+                			undos.remove(tid);
+                			break;
+                		}
+                	case COMMIT_RECORD:
+                		//do nothing
+                		{
+                			Long tid = raf.readLong();
+                			tidToFirstLogRecord.remove(tid);
+                			undos.remove(tid);
+                			curOffset = raf.getFilePointer();
+                			break;
+                		}
+                	
+                	case BEGIN_RECORD:
+                		{
+                			long tid = raf.readLong();
+                			tidToFirstLogRecord.put(tid, curOffset);
+                			curOffset = raf.getFilePointer();
+                			break;
+                		}
+                	case UPDATE_RECORD:
+                		{
+                			long tid = raf.readLong();
+                			Page beforePg = readPageData(raf);  
+            				Page afterPg = readPageData(raf);
+            				if(commits.contains(tid)) {	
+                				Database.getCatalog().getDatabaseFile(afterPg.getId().getTableId()).writePage(afterPg);
+                				Database.getBufferPool().discardPage(beforePg.getId());
+                			}
+                			curOffset = raf.getFilePointer();
+                			break;
+                		}
+                	}
+                	curOffset += LONG_SIZE; //start_offset
+                	
+                }
+                
+                //step3 undo phase
+                for(Long tid: undos) {
+                	dorollback(tid, raf.length());
+                }
+                
             }
          }
     }
